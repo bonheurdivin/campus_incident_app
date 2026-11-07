@@ -1,0 +1,110 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Helpers ----------
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Only ALU email addresses (confirm your exact domains)
+    function aluEmail() {
+      return signedIn() &&
+        request.auth.token.email.lower().matches('.*@(alustudent|alueducation)[.]com');
+    }
+
+    // Signed in, ALU email, and email verified
+    function verifiedMember() {
+      return aluEmail() && request.auth.token.email_verified == true;
+    }
+
+    function userDocPath() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+
+    function isStaff() {
+      return verifiedMember() &&
+        exists(userDocPath()) &&
+        get(userDocPath()).data.role == 'staff';
+    }
+
+    function validCategory(c) {
+      return c in ['facilities', 'water', 'electricity', 'safety', 'sanitation'];
+    }
+
+    function validFields(d) {
+      return d.title is string && d.title.size() >= 5 && d.title.size() <= 80 &&
+        d.description is string && d.description.size() >= 10 && d.description.size() <= 500 &&
+        d.location is string && d.location.size() >= 1 && d.location.size() <= 100 &&
+        validCategory(d.category);
+    }
+
+    // ---------- Users ----------
+    match /users/{uid} {
+      // You can read your own profile; staff can read any profile
+      allow read: if signedIn() && (request.auth.uid == uid || isStaff());
+
+      // Registration: you can only create your OWN document, as a student,
+      // with an ALU email. Nobody can make themselves staff.
+      allow create: if aluEmail()
+        && request.auth.uid == uid
+        && request.resource.data.role == 'student'
+        && request.resource.data.email == request.auth.token.email.lower();
+
+      // Roles are changed manually in the console only
+      allow update, delete: if false;
+    }
+
+    // ---------- Incidents ----------
+    match /incidents/{incidentId} {
+      allow read: if verifiedMember();
+
+      // Students create reports as themselves, always starting as "submitted"
+      allow create: if verifiedMember()
+        && request.resource.data.reporterId == request.auth.uid
+        && request.resource.data.status == 'submitted'
+        && validFields(request.resource.data);
+
+      allow update: if
+        // Staff may change ONLY the status (and its timestamp)
+        (isStaff() &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'updatedAt']) &&
+          request.resource.data.status in ['submitted', 'inProgress', 'resolved'])
+        ||
+        // The reporter may edit details, but only while still "submitted"
+        (verifiedMember() &&
+          resource.data.reporterId == request.auth.uid &&
+          resource.data.status == 'submitted' &&
+          request.resource.data.status == 'submitted' &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['title', 'description', 'location', 'category', 'updatedAt']) &&
+          validFields(request.resource.data));
+
+      // Staff can delete any report; students only their own un-started ones
+      allow delete: if isStaff() ||
+        (verifiedMember() &&
+          resource.data.reporterId == request.auth.uid &&
+          resource.data.status == 'submitted');
+
+      // ---------- Status history (timeline) ----------
+      match /statusHistory/{entryId} {
+        allow read: if verifiedMember();
+
+        allow create: if isStaff() ||
+          // the first "submitted" entry written together with the report
+          (verifiedMember() &&
+            request.resource.data.status == 'submitted' &&
+            getAfter(/databases/$(database)/documents/incidents/$(incidentId))
+              .data.reporterId == request.auth.uid);
+
+        allow update: if false;
+
+        allow delete: if isStaff() ||
+          (verifiedMember() &&
+            get(/databases/$(database)/documents/incidents/$(incidentId))
+              .data.reporterId == request.auth.uid);
+      }
+    }
+  }
+}
